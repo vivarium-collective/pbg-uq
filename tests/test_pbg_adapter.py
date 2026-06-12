@@ -51,10 +51,10 @@ def _document():
                 "inputs": {},
                 "outputs": {"y": ["y"]},
             },
-            # Pre-init y to steady-state for default params (y=2*3+1=7.0).
-            # The adapter's warmup run overrides this for other param values,
-            # ensuring xarray-mode initial fires also see the correct value.
-            "y": 7.0,
+            # Initial y is a placeholder; the emitter skips its first fire
+            # (step 0, before any process update) so this value never enters
+            # the time-mean.  No warmup or state override is needed.
+            "y": 0.0,
         }
     }
 

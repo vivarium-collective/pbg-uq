@@ -125,6 +125,21 @@ def _make_emitter_class(observables: list[str], inner_config: dict) -> type:
             self._step: int = 0
 
         def update(self, state: dict) -> dict:
+            # process-bigraph fires every step-type emitter once *before* the
+            # first process update runs (pre-update placeholder frame).  For
+            # the document-path mode that frame contains the document's initial
+            # placeholder value (e.g. y=0.0) rather than any real simulation
+            # output, so it must not be included in the time-mean.
+            #
+            # Empirically: each comp.run(interval) call triggers exactly two
+            # emitter fires — one before and one after the process update.
+            # _step==0 is always the pre-simulation placeholder; all subsequent
+            # calls (including the pre-update fires on step 2+ where y already
+            # holds the post-update value from the previous interval) are valid
+            # simulation observations and should be recorded.
+            if self._step == 0:
+                self._step += 1
+                return {}
             t = float(self._step)
             self._step += 1
             wrapped = {

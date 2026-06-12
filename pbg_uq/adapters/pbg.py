@@ -11,19 +11,17 @@ PbgAdapter.from_builder(*, build_composite, param_bounds, ...)
 
 Notes
 -----
-* XArray mode uses a **warmup step** (one interval without the emitter) to
-  initialize observable values to their process steady-state before the emitter
-  run begins.  This eliminates the initial-state bias that would otherwise appear
-  when the emitter fires once before any process update (process-bigraph fires
-  steps that are "ready" at the start of each ``comp.run()`` before the process
-  loop).  After the warmup the pre-initialized observable values are overwritten
-  in the document state, so all emitter fires see the correct steady-state value
-  and the time-mean converges exactly.
+* XArray mode: process-bigraph fires every step-type process (including the
+  emitter) twice per ``comp.run(interval)`` call — once before and once after
+  the process-update loop.  The very first fire (before any process has run)
+  captures only the document's initial placeholder value and is discarded by
+  the emitter (``_step == 0`` guard in ``emit._PbgXArrayEmitter.update``).
+  All remaining fires are valid post-update observations and are included in
+  the time-mean.  No warmup run is needed.
 
-* Poll mode reads ``comp.state`` after each ``comp.run()`` call, so it naturally
-  sees post-process values.  With the warmup applied to xarray mode both paths
-  agree to floating-point precision for constant processes (and agree in
-  expectation for stochastic ones).
+* Poll mode reads ``comp.state`` after each ``comp.run()`` call, so it
+  naturally sees post-process values.  Both modes recover the same time-mean
+  for constant processes and agree in expectation for stochastic ones.
 
 * Parallelism: ``max_workers > 1`` is accepted but runs sequentially because
   ``core`` and ``document`` may not pickle cleanly across processes.  A future
@@ -235,36 +233,23 @@ class PbgAdapter:
     def _run_doc_xarray(self, sample: dict[str, float], out_uri: str) -> dict:
         """Document-path + xarray emitter run for one sample.
 
-        A warmup step is performed without the emitter so that observable
-        state keys hold their process steady-state values before the emitter
-        attaches.  This ensures the emitter's initial-state fires record the
-        correct value rather than the document's pre-initialized placeholder.
+        Deepcopy the document, inject parameter values, attach the XArray
+        emitter, build the Composite, run for nsteps, then close and read back
+        the zarr store.
+
+        The emitter skips its very first fire (``_step == 0``), which
+        process-bigraph fires before any process update runs and therefore
+        captures only the document's initial placeholder value.  All subsequent
+        fires (both pre- and post-update for steps 2+) hold valid simulation
+        observations and are included in the time-mean.  No warmup run is
+        needed.
         """
         from process_bigraph import Composite  # lazy import to keep module light
 
-        # --- warmup: run one interval without emitter ---
-        doc_w = copy.deepcopy(self._document)
-        state_w = doc_w.get("state", doc_w)
-        for path, val in sample.items():
-            set_path(state_w, path, val)
-        comp_w = Composite(doc_w, core=self._core)
-        comp_w.run(self._interval)
-        warmup_obs = {obs: read_observable(comp_w.state, obs) for obs in self.observables}
-        del comp_w
-        gc.collect()
-
-        # --- emitter run: deepcopy + inject params + set warmup values ---
         doc = copy.deepcopy(self._document)
         state = doc.get("state", doc)
         for path, val in sample.items():
             set_path(state, path, val)
-        # Override initial observable values with warmup steady-state
-        for obs, val in warmup_obs.items():
-            v = val
-            if isinstance(v, np.ndarray):
-                state[obs] = v
-            else:
-                state[obs] = float(v)
 
         new_state = attach_xarray_emitter(state, self.observables, out_uri, self._core)
         if "state" in doc:
