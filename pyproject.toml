@@ -11,16 +11,9 @@ dependencies = [
     "pytuq[all]>=1.0.0",
     "process-bigraph",
     "bigraph-schema",
-    "pbg-emitters[xarray]",
+    "pbg-emitters[xarray]>=0.1.0",
     "polars",
 ]
-
-# pbg-emitters is not on PyPI; resolve it from the GitHub repo (the
-# decouple-ecoli + RunReader partition fix is on main as of PR #10).
-# For local development, override with an editable install:
-#   uv pip install -e /path/to/pbg-emitters --no-deps
-[tool.uv.sources]
-pbg-emitters = { git = "https://github.com/vivarium-collective/pbg-emitters.git", branch = "main" }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
