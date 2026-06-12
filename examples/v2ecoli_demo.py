@@ -5,8 +5,8 @@ simulations:
   sample → PCE surrogate → Sobol indices → HTML report
 
 Three translation-related parameters from the PolypeptideElongation process
-are varied; three mass/growth observables are extracted from the composite
-state after each run.
+are varied; three mass/growth observables are extracted via the XArray emitter
+(run_multigen_xarray → zarr store → xarray DataTree) after each run.
 
 Run with v2ecoli's venv from the v2ecoli repo root::
 
@@ -18,16 +18,17 @@ Expected result: ``gtpPerElongation`` and ``basal_elongation_rate`` dominate
 (GTP cost has a strong inverse effect on growth; elongation rate sets the
 production ceiling).
 
-Observable extraction: composite-state polling (``listeners.mass``).
-This avoids the zarr/XArray write round-trip and gives exact values
-at the end of the fixed-duration run.
+Observable collection: XArray emitter (run_multigen_xarray + xarray DataTree).
+Data is written to a per-sample temp zarr store, read back as time-means, then
+the store is deleted.
 """
 from __future__ import annotations
 
-import copy
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -44,7 +45,8 @@ os.environ.setdefault("POLARS_MAX_THREADS", "1")
 # v2ecoli setup — pre-load once at module level (lru_cache reuse)
 # ---------------------------------------------------------------------------
 _CACHE_DIR = "/Users/eranagmon/code/v2ecoli/out/cache"
-_N_STEPS = 60  # simulation seconds per sample (~9 s wall time on M-series Mac)
+_N_STEPS = 60   # simulation seconds per sample; chunk=10 → 6 emits per run
+_CHUNK = 10     # ticks between emitter updates; must be < _N_STEPS
 
 print("[v2ecoli_demo] Loading v2ecoli modules…", flush=True)
 _t_import = time.perf_counter()
@@ -52,6 +54,7 @@ _t_import = time.perf_counter()
 from v2ecoli.core import build_core, load_cache_bundle          # noqa: E402
 from v2ecoli.composites.baseline import baseline                 # noqa: E402
 from v2ecoli.composites._helpers import set_null_emitter_override  # noqa: E402
+from v2ecoli.library.xarray_run import view_from_emit_paths, run_multigen_xarray  # noqa: E402
 from process_bigraph import Composite                             # noqa: E402
 
 print(f"[v2ecoli_demo] Loading cache bundle from {_CACHE_DIR}…", flush=True)
@@ -81,17 +84,68 @@ BOUNDS = np.array([
     [2.5,   6.5],   # gtpPerElongation
 ])
 
-OBS_NAMES = ["dry_mass_fg", "protein_mass_fg", "instantaneous_growth_rate"]
+OBS_NAMES = ["dry_mass", "cell_mass", "instantaneous_growth_rate"]
+
+# XArray view — built once from dotted emit paths (listeners.mass.*)
+_VIEW = view_from_emit_paths([
+    "listeners.mass.dry_mass",
+    "listeners.mass.cell_mass",
+    "listeners.mass.instantaneous_growth_rate",
+])
+
+# Fixed metadata for the zarr partition; store_path is per-sample so no clash
+_METADATA_BASE = {
+    "experiment_id": "uq_sample",
+    "variant": 0,
+    "lineage_seed": 0,
+    "time_step": 1.0,
+    "max_duration": float(_N_STEPS),
+}
 
 
 # ---------------------------------------------------------------------------
-# Helper: strip pint units
+# Helper: read time-means from a run_multigen_xarray zarr store
 # ---------------------------------------------------------------------------
-def _to_float(v) -> float:
-    """Return numeric value; strips pint Quantity if present."""
-    if hasattr(v, "magnitude"):
-        return float(v.magnitude)
-    return float(v)
+def _read_store_means(store_path: str) -> np.ndarray:
+    """Open *store_path* zarr with xarray and return time-mean for each obs.
+
+    RunReader._xarray_series is not used here because it reads time coords
+    from the root node whereas XArrayEmitter writes them at the partition
+    (lineage_seed=0) level — a format mismatch in the installed pbg_emitters
+    version.  Reading the DataTree directly avoids the issue.
+    """
+    import xarray as xr
+
+    dt = xr.open_datatree(store_path, engine="zarr", consolidated=False)
+
+    exp_id = _METADATA_BASE["experiment_id"]
+    variant = _METADATA_BASE["variant"]
+    seed = _METADATA_BASE["lineage_seed"]
+    partition_path = f"/experiment_id={exp_id}/variant={variant}/lineage_seed={seed}"
+
+    partition_ds = dt[partition_path].ds
+    gen_numbers = sorted(
+        int(v.replace("time_gen=", ""))
+        for v in partition_ds.data_vars
+        if v.startswith("time_gen=")
+    )
+
+    obs_leaf = ["dry_mass", "cell_mass", "instantaneous_growth_rate"]
+    means = []
+    for obs in obs_leaf:
+        obs_path = f"{partition_path}/{obs}"
+        if obs_path not in dt.groups:
+            means.append(0.0)
+            continue
+        obs_ds = dt[obs_path].ds
+        all_vals: list[float] = []
+        for gen in gen_numbers:
+            gen_var = f"generation={gen}"
+            if gen_var in obs_ds.data_vars:
+                all_vals.extend(obs_ds[gen_var].values.ravel().tolist())
+        means.append(float(np.mean(all_vals)) if all_vals else 0.0)
+
+    return np.array(means)
 
 
 # ---------------------------------------------------------------------------
@@ -100,16 +154,19 @@ def _to_float(v) -> float:
 def _run_one(x: np.ndarray, seed: int = 0) -> np.ndarray:
     """Build and run one v2ecoli composite; return observable vector.
 
-    Uses ``config_overrides`` on ``baseline()`` so the parameter mutation
-    is applied to the pre-loaded cache bundle without any disk I/O.
+    Uses ``config_overrides`` on ``baseline()`` so the parameter mutation is
+    applied to the pre-loaded cache bundle without any disk I/O on the ParCa
+    side.  The simulation data is collected via an external XArrayEmitter
+    (run_multigen_xarray) written to a per-sample temp zarr store.
     """
     config_overrides = {
         "ecoli-polypeptide-elongation.ribosomeElongationRate": float(x[0]),
         "ecoli-polypeptide-elongation.basal_elongation_rate":  float(x[1]),
         "ecoli-polypeptide-elongation.gtpPerElongation":       float(x[2]),
     }
-    # Suppress default ParquetEmitter: the null-emitter flag is read by
-    # baseline() during state construction; restore it after the build.
+
+    # Suppress default ParquetEmitter; the null-emitter flag is read by
+    # baseline() during state construction — restore it after the build.
     set_null_emitter_override(True)
     try:
         doc = baseline(core=_core, seed=seed, bundle=_bundle,
@@ -118,16 +175,23 @@ def _run_one(x: np.ndarray, seed: int = 0) -> np.ndarray:
         set_null_emitter_override(False)
 
     composite = Composite(doc, core=_core)
-    composite.run(_N_STEPS)
 
-    # --- read observables directly from composite state ---
-    cell = composite.state["agents"]["0"]
-    mass = cell["listeners"]["mass"]
-    return np.array([
-        _to_float(mass["dry_mass"]),
-        _to_float(mass["protein_mass"]),
-        _to_float(mass.get("instantaneous_growth_rate", 0.0)),
-    ])
+    # Per-sample temp zarr store — deleted after reading
+    tmp_dir = tempfile.mkdtemp(prefix="v2ecoli_uq_")
+    store_path = os.path.join(tmp_dir, "run.zarr")
+    try:
+        run_multigen_xarray(
+            composite,
+            store_path=store_path,
+            view=_VIEW,
+            metadata_base=_METADATA_BASE,
+            max_steps=_N_STEPS,
+            max_generations=1,
+            chunk=_CHUNK,
+        )
+        return _read_store_means(store_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +214,7 @@ def evaluate(X: np.ndarray) -> np.ndarray:
             Y[i] = y
             last_good = y.copy()
             print(f"  sample {i+1}/{n} done in {time.perf_counter()-t0:.1f}s  "
-                  f"dry={y[0]:.2f} prot={y[1]:.2f} igr={y[2]:.5g}", flush=True)
+                  f"dry={y[0]:.2f} cell={y[1]:.2f} igr={y[2]:.5g}", flush=True)
         except Exception as exc:
             fallback = last_good if last_good is not None else np.zeros(len(OBS_NAMES))
             Y[i] = fallback
