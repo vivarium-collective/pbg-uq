@@ -9,7 +9,12 @@ dependencies = [
     "pytuq[all]>=1.0.0",
     "process-bigraph",
     "bigraph-schema",
+    "pbg-emitters[xarray]",
+    "polars",
 ]
+
+[tool.uv.sources]
+pbg-emitters = { path = "/Users/eranagmon/code/pbg-emitters", editable = true }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
