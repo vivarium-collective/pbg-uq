@@ -13,8 +13,12 @@ dependencies = [
     "polars",
 ]
 
+# pbg-emitters is not on PyPI; resolve it from the GitHub repo (the
+# decouple-ecoli + RunReader partition fix is on main as of PR #10).
+# For local development, override with an editable install:
+#   uv pip install -e /path/to/pbg-emitters --no-deps
 [tool.uv.sources]
-pbg-emitters = { path = "/Users/eranagmon/code/pbg-emitters", editable = true }
+pbg-emitters = { git = "https://github.com/vivarium-collective/pbg-emitters.git", branch = "main" }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
