@@ -106,46 +106,20 @@ _METADATA_BASE = {
 # ---------------------------------------------------------------------------
 # Helper: read time-means from a run_multigen_xarray zarr store
 # ---------------------------------------------------------------------------
+_OBS_LEAVES = ["dry_mass", "cell_mass", "instantaneous_growth_rate"]
+
+
 def _read_store_means(store_path: str) -> np.ndarray:
-    """Open *store_path* zarr with xarray and return time-mean for each obs.
+    """Time-mean of each mass observable from the run_multigen_xarray zarr store.
 
-    RunReader._xarray_series is not used here because it reads time coords
-    from the root node whereas XArrayEmitter writes them at the partition
-    (lineage_seed=0) level — a format mismatch in the installed pbg_emitters
-    version.  Reading the DataTree directly avoids the issue.
+    Delegates to ``pbg_uq.emit.read_run`` (RunReader-based, with suffix matching
+    onto the emitter's partition-prefixed names). RunReader now resolves time
+    coords at the partition path, so this works directly (pbg-emitters PR #10).
     """
-    import xarray as xr
+    from pbg_uq.emit import read_run
 
-    dt = xr.open_datatree(store_path, engine="zarr", consolidated=False)
-
-    exp_id = _METADATA_BASE["experiment_id"]
-    variant = _METADATA_BASE["variant"]
-    seed = _METADATA_BASE["lineage_seed"]
-    partition_path = f"/experiment_id={exp_id}/variant={variant}/lineage_seed={seed}"
-
-    partition_ds = dt[partition_path].ds
-    gen_numbers = sorted(
-        int(v.replace("time_gen=", ""))
-        for v in partition_ds.data_vars
-        if v.startswith("time_gen=")
-    )
-
-    obs_leaf = ["dry_mass", "cell_mass", "instantaneous_growth_rate"]
-    means = []
-    for obs in obs_leaf:
-        obs_path = f"{partition_path}/{obs}"
-        if obs_path not in dt.groups:
-            means.append(0.0)
-            continue
-        obs_ds = dt[obs_path].ds
-        all_vals: list[float] = []
-        for gen in gen_numbers:
-            gen_var = f"generation={gen}"
-            if gen_var in obs_ds.data_vars:
-                all_vals.extend(obs_ds[gen_var].values.ravel().tolist())
-        means.append(float(np.mean(all_vals)) if all_vals else 0.0)
-
-    return np.array(means)
+    agg = read_run(store_path, _OBS_LEAVES)
+    return np.array([agg[o] for o in _OBS_LEAVES])
 
 
 # ---------------------------------------------------------------------------
