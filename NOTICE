@@ -1,0 +1,12 @@
+pbg-uq
+Copyright 2026 The Vivarium Collective
+
+This product includes software originally developed as part of uqEcoli
+(https://github.com/vivarium-collective/uqEcoli), Copyright 2025 Alex Patrie,
+licensed under the Apache License, Version 2.0. The forward-UQ core
+(Polynomial Chaos Expansion + Sobol indices), the on-disk sample cache, the
+result containers, and the HTML report were lifted from that project and
+adapted to be backend-agnostic.
+
+Numerically-significant computation is delegated to PyTUQ
+(https://github.com/sandialabs/pytuq), Sandia National Laboratories.
